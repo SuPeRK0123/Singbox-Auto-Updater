@@ -171,7 +171,9 @@ detect_runtime() {
 }
 
 curl_api() {
-  curl -fsSL -H "Accept: application/vnd.github+json" "$1"
+  curl -fsSL --retry 3 --retry-delay 2 --show-error \
+    -H "Accept: application/vnd.github+json" \
+    "$1"
 }
 
 curl_download() {
