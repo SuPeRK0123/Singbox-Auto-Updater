@@ -141,11 +141,8 @@ detect_runtime() {
   fi
 
   case "$PACKAGE_MANAGER" in
-    deb|apk)
-      ;;
-    *)
-      die "unsupported PACKAGE_MANAGER: $PACKAGE_MANAGER"
-      ;;
+    deb|apk) ;;
+    *) die "unsupported PACKAGE_MANAGER: $PACKAGE_MANAGER" ;;
   esac
 
   if [ "$SERVICE_MANAGER" = "auto" ]; then
@@ -159,11 +156,8 @@ detect_runtime() {
   fi
 
   case "$SERVICE_MANAGER" in
-    systemd|initd)
-      ;;
-    *)
-      die "unsupported SERVICE_MANAGER: $SERVICE_MANAGER"
-      ;;
+    systemd|initd) ;;
+    *) die "unsupported SERVICE_MANAGER: $SERVICE_MANAGER" ;;
   esac
 
   if [ "$PACKAGE_OS" = "auto" ]; then
@@ -177,19 +171,11 @@ detect_runtime() {
 }
 
 curl_api() {
-  local url="$1"
-
-  curl -fsSL \
-    -H "Accept: application/vnd.github+json" \
-    "$url"
+  curl -fsSL -H "Accept: application/vnd.github+json" "$1"
 }
 
 curl_download() {
-  local url="$1"
-  local output="$2"
-
-  curl -fL --retry 3 --retry-delay 2 --show-error \
-    -o "$output" "$url"
+  curl -fL --retry 3 --retry-delay 2 --show-error -o "$2" "$1"
 }
 
 normalize_version() {
@@ -212,11 +198,10 @@ detect_arch() {
       ;;
     apk)
       if [ -r /etc/openwrt_release ]; then
-        # shellcheck disable=SC1091
         . /etc/openwrt_release
         ARCH="${DISTRIB_ARCH:-}"
       fi
-      if [ -z "$ARCH" ] && command -v apk >/dev/null 2>&1; then
+      if [ -z "$ARCH" ]; then
         ARCH="$(apk --print-arch 2>/dev/null | awk 'NF { print; exit }' || true)"
       fi
       ;;
@@ -284,12 +269,8 @@ parse_first_prerelease_tag() {
       sub(/^.*"tag_name"[[:space:]]*:[[:space:]]*"/, "", tag)
       sub(/".*$/, "", tag)
     }
-    /"draft"[[:space:]]*:[[:space:]]*true/ {
-      draft = 1
-    }
-    /"draft"[[:space:]]*:[[:space:]]*false/ {
-      draft = 0
-    }
+    /"draft"[[:space:]]*:[[:space:]]*true/ { draft = 1 }
+    /"draft"[[:space:]]*:[[:space:]]*false/ { draft = 0 }
     /"prerelease"[[:space:]]*:[[:space:]]*true/ {
       if (first == "" && tag != "" && draft != 1) {
         sub(/^v/, "", tag)
@@ -297,9 +278,7 @@ parse_first_prerelease_tag() {
       }
     }
     END {
-      if (first != "") {
-        print first
-      }
+      if (first != "") print first
     }
   '
 }
@@ -314,6 +293,10 @@ fetch_latest_beta_version() {
     api_url="${RELEASE_API_BASE}/repos/${RELEASE_REPO}/releases?per_page=30&page=${page}"
     if ! releases_json="$(curl_api "$api_url")"; then
       log "WARN: failed to fetch GitHub releases page $page"
+      if [ "$page" = "1" ]; then
+        log "ERROR: first GitHub releases page is unavailable; refusing to use older pages as latest"
+        return 1
+      fi
       continue
     fi
 
@@ -331,12 +314,8 @@ package_filename() {
   local version="$1"
 
   case "$PACKAGE_MANAGER" in
-    deb)
-      printf '%s_%s_%s_%s.deb\n' "$RELEASE_ASSET_NAME" "$version" "$PACKAGE_OS" "$ARCH"
-      ;;
-    apk)
-      printf '%s_%s_%s_%s.apk\n' "$RELEASE_ASSET_NAME" "$version" "$PACKAGE_OS" "$ARCH"
-      ;;
+    deb) printf '%s_%s_%s_%s.deb\n' "$RELEASE_ASSET_NAME" "$version" "$PACKAGE_OS" "$ARCH" ;;
+    apk) printf '%s_%s_%s_%s.apk\n' "$RELEASE_ASSET_NAME" "$version" "$PACKAGE_OS" "$ARCH" ;;
   esac
 }
 
@@ -386,8 +365,7 @@ verify_apk() {
   fi
 
   case "$apk_path" in
-    *.apk)
-      ;;
+    *.apk) ;;
     *)
       log "ERROR: unexpected APK package suffix: $apk_path"
       return 1
@@ -406,11 +384,35 @@ verify_apk() {
 }
 
 verify_package() {
-  local package_path="$1"
+  case "$PACKAGE_MANAGER" in
+    deb) verify_deb "$1" ;;
+    apk) verify_apk "$1" ;;
+  esac
+}
+
+debian_package_version_from_release() {
+  local version="$1"
+
+  case "$version" in
+    *-*) printf '%s~%s\n' "${version%%-*}" "${version#*-}" ;;
+    *) printf '%s\n' "$version" ;;
+  esac
+}
+
+ensure_not_downgrade() {
+  local current_package_version
+  local latest_package_version
 
   case "$PACKAGE_MANAGER" in
-    deb) verify_deb "$package_path" ;;
-    apk) verify_apk "$package_path" ;;
+    deb)
+      current_package_version="$(debian_package_version_from_release "$CURRENT_VERSION")"
+      latest_package_version="$(debian_package_version_from_release "$LATEST_VERSION")"
+      if dpkg --compare-versions "$latest_package_version" lt "$current_package_version"; then
+        die "refusing to downgrade: current=$CURRENT_VERSION candidate=$LATEST_VERSION"
+      fi
+      ;;
+    apk)
+      ;;
   esac
 }
 
@@ -461,12 +463,8 @@ run_config_check() {
 
 is_number() {
   case "$1" in
-    ''|*[!0-9]*)
-      return 1
-      ;;
-    *)
-      return 0
-      ;;
+    ''|*[!0-9]*) return 1 ;;
+    *) return 0 ;;
   esac
 }
 
@@ -521,8 +519,7 @@ wait_for_systemd_service_active() {
   while [ "$(date +%s)" -lt "$deadline" ]; do
     state="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
     case "$state" in
-      active|activating)
-        ;;
+      active|activating) ;;
       *)
         log "service state is not healthy: ${state:-unknown}"
         return 1
@@ -574,10 +571,8 @@ wait_for_initd_service_active() {
 }
 
 wait_for_service_active() {
-  local baseline_restarts="${1:-}"
-
   case "$SERVICE_MANAGER" in
-    systemd) wait_for_systemd_service_active "$baseline_restarts" ;;
+    systemd) wait_for_systemd_service_active "${1:-}" ;;
     initd) wait_for_initd_service_active ;;
   esac
 }
@@ -600,23 +595,17 @@ log_recent_service_logs() {
 }
 
 install_package() {
-  local package_path="$1"
-
-  log "installing package: $package_path"
+  log "installing package: $1"
   case "$PACKAGE_MANAGER" in
-    deb) dpkg -i "$package_path" ;;
-    apk) apk add --allow-untrusted "$package_path" ;;
+    deb) dpkg -i "$1" ;;
+    apk) apk add --allow-untrusted "$1" ;;
   esac
 }
 
 restart_service() {
   case "$SERVICE_MANAGER" in
-    systemd)
-      systemctl daemon-reload && systemctl restart "$SERVICE_NAME"
-      ;;
-    initd)
-      "$INIT_SCRIPT" restart
-      ;;
+    systemd) systemctl daemon-reload && systemctl restart "$SERVICE_NAME" ;;
+    initd) "$INIT_SCRIPT" restart ;;
   esac
 }
 
@@ -718,6 +707,8 @@ main() {
     log "already on latest beta; no update needed"
     exit 0
   fi
+
+  ensure_not_downgrade
 
   log "caching rollback package for current version"
   ROLLBACK_PACKAGE="$(ensure_cached_package "$CURRENT_VERSION")" ||
