@@ -30,15 +30,24 @@ ARCH=""
 SING_BOX_BIN=""
 ROLLBACK_PACKAGE=""
 LOCK_ACQUIRED=0
+FORCE_VERSION=""
+FORCE_INSTALL=0
+LOG_PIPE=""
 
 usage() {
   cat <<'USAGE'
 Usage: singbox-updater
+       singbox-updater --force VERSION
 
 Defaults:
   config file: /etc/sing-box/config.json
   package:     sing-box
   service:     sing-box
+
+Options:
+  --force VERSION  install the specified release package only; skip post-install
+                   config check, service restart, and automatic rollback
+  -h, --help       show this help
 
 Optional overrides:
   PACKAGE_MANAGER=deb|apk
@@ -48,10 +57,41 @@ Optional overrides:
 USAGE
 }
 
-if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
-  usage
-  exit 0
-fi
+parse_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --force|--force-version)
+        if [ -z "${2:-}" ]; then
+          printf '%s\n' "ERROR: $1 requires a version argument" >&2
+          usage >&2
+          exit 1
+        fi
+        FORCE_VERSION="$(normalize_version "$2")"
+        FORCE_INSTALL=1
+        shift 2
+        ;;
+      --force=*)
+        FORCE_VERSION="$(normalize_version "${1#*=}")"
+        FORCE_INSTALL=1
+        shift
+        ;;
+      --force-version=*)
+        FORCE_VERSION="$(normalize_version "${1#*=}")"
+        FORCE_INSTALL=1
+        shift
+        ;;
+      *)
+        printf '%s\n' "ERROR: unknown argument: $1" >&2
+        usage >&2
+        exit 1
+        ;;
+    esac
+  done
+}
 
 timestamp() {
   date '+%Y-%m-%d %H:%M:%S%z'
@@ -77,6 +117,9 @@ cleanup() {
     rm -f "$LOCK_PATH/pid" 2>/dev/null || true
     rmdir "$LOCK_PATH" 2>/dev/null || true
   fi
+  if [ -n "$LOG_PIPE" ] && [ -p "$LOG_PIPE" ]; then
+    rm -f "$LOG_PIPE" 2>/dev/null || true
+  fi
 }
 
 trap cleanup EXIT HUP INT TERM
@@ -90,7 +133,17 @@ require_root() {
 setup_logging() {
   mkdir -p "$(dirname "$LOG_FILE")"
   touch "$LOG_FILE"
-  exec >>"$LOG_FILE" 2>&1
+
+  LOG_PIPE="${TMPDIR:-/tmp}/singbox-updater.log.$$"
+  if command -v tee >/dev/null 2>&1 && command -v mkfifo >/dev/null 2>&1 &&
+    mkfifo "$LOG_PIPE" 2>/dev/null; then
+    tee -a "$LOG_FILE" <"$LOG_PIPE" &
+    exec >"$LOG_PIPE" 2>&1
+    rm -f "$LOG_PIPE"
+  else
+    log "WARN: failed to create log pipe; output will be written to log file only"
+    exec >>"$LOG_FILE" 2>&1
+  fi
 }
 
 acquire_lock() {
@@ -141,8 +194,11 @@ detect_runtime() {
   fi
 
   case "$PACKAGE_MANAGER" in
-    deb|apk) ;;
-    *) die "unsupported PACKAGE_MANAGER: $PACKAGE_MANAGER" ;;
+    deb|apk)
+      ;;
+    *)
+      die "unsupported PACKAGE_MANAGER: $PACKAGE_MANAGER"
+      ;;
   esac
 
   if [ "$SERVICE_MANAGER" = "auto" ]; then
@@ -156,8 +212,11 @@ detect_runtime() {
   fi
 
   case "$SERVICE_MANAGER" in
-    systemd|initd) ;;
-    *) die "unsupported SERVICE_MANAGER: $SERVICE_MANAGER" ;;
+    systemd|initd)
+      ;;
+    *)
+      die "unsupported SERVICE_MANAGER: $SERVICE_MANAGER"
+      ;;
   esac
 
   if [ "$PACKAGE_OS" = "auto" ]; then
@@ -171,13 +230,19 @@ detect_runtime() {
 }
 
 curl_api() {
-  curl -fsSL --retry 3 --retry-delay 2 --show-error \
+  local url="$1"
+
+  curl -fsSL \
     -H "Accept: application/vnd.github+json" \
-    "$1"
+    "$url"
 }
 
 curl_download() {
-  curl -fL --retry 3 --retry-delay 2 --show-error -o "$2" "$1"
+  local url="$1"
+  local output="$2"
+
+  curl -fL --retry 3 --retry-delay 2 --show-error \
+    -o "$output" "$url"
 }
 
 normalize_version() {
@@ -200,10 +265,11 @@ detect_arch() {
       ;;
     apk)
       if [ -r /etc/openwrt_release ]; then
+        # shellcheck disable=SC1091
         . /etc/openwrt_release
         ARCH="${DISTRIB_ARCH:-}"
       fi
-      if [ -z "$ARCH" ]; then
+      if [ -z "$ARCH" ] && command -v apk >/dev/null 2>&1; then
         ARCH="$(apk --print-arch 2>/dev/null | awk 'NF { print; exit }' || true)"
       fi
       ;;
@@ -271,8 +337,12 @@ parse_first_prerelease_tag() {
       sub(/^.*"tag_name"[[:space:]]*:[[:space:]]*"/, "", tag)
       sub(/".*$/, "", tag)
     }
-    /"draft"[[:space:]]*:[[:space:]]*true/ { draft = 1 }
-    /"draft"[[:space:]]*:[[:space:]]*false/ { draft = 0 }
+    /"draft"[[:space:]]*:[[:space:]]*true/ {
+      draft = 1
+    }
+    /"draft"[[:space:]]*:[[:space:]]*false/ {
+      draft = 0
+    }
     /"prerelease"[[:space:]]*:[[:space:]]*true/ {
       if (first == "" && tag != "" && draft != 1) {
         sub(/^v/, "", tag)
@@ -280,7 +350,9 @@ parse_first_prerelease_tag() {
       }
     }
     END {
-      if (first != "") print first
+      if (first != "") {
+        print first
+      }
     }
   '
 }
@@ -316,8 +388,12 @@ package_filename() {
   local version="$1"
 
   case "$PACKAGE_MANAGER" in
-    deb) printf '%s_%s_%s_%s.deb\n' "$RELEASE_ASSET_NAME" "$version" "$PACKAGE_OS" "$ARCH" ;;
-    apk) printf '%s_%s_%s_%s.apk\n' "$RELEASE_ASSET_NAME" "$version" "$PACKAGE_OS" "$ARCH" ;;
+    deb)
+      printf '%s_%s_%s_%s.deb\n' "$RELEASE_ASSET_NAME" "$version" "$PACKAGE_OS" "$ARCH"
+      ;;
+    apk)
+      printf '%s_%s_%s_%s.apk\n' "$RELEASE_ASSET_NAME" "$version" "$PACKAGE_OS" "$ARCH"
+      ;;
   esac
 }
 
@@ -367,7 +443,8 @@ verify_apk() {
   fi
 
   case "$apk_path" in
-    *.apk) ;;
+    *.apk)
+      ;;
     *)
       log "ERROR: unexpected APK package suffix: $apk_path"
       return 1
@@ -386,9 +463,11 @@ verify_apk() {
 }
 
 verify_package() {
+  local package_path="$1"
+
   case "$PACKAGE_MANAGER" in
-    deb) verify_deb "$1" ;;
-    apk) verify_apk "$1" ;;
+    deb) verify_deb "$package_path" ;;
+    apk) verify_apk "$package_path" ;;
   esac
 }
 
@@ -396,8 +475,12 @@ debian_package_version_from_release() {
   local version="$1"
 
   case "$version" in
-    *-*) printf '%s~%s\n' "${version%%-*}" "${version#*-}" ;;
-    *) printf '%s\n' "$version" ;;
+    *-*)
+      printf '%s~%s\n' "${version%%-*}" "${version#*-}"
+      ;;
+    *)
+      printf '%s\n' "$version"
+      ;;
   esac
 }
 
@@ -465,8 +548,12 @@ run_config_check() {
 
 is_number() {
   case "$1" in
-    ''|*[!0-9]*) return 1 ;;
-    *) return 0 ;;
+    ''|*[!0-9]*)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
   esac
 }
 
@@ -521,7 +608,8 @@ wait_for_systemd_service_active() {
   while [ "$(date +%s)" -lt "$deadline" ]; do
     state="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
     case "$state" in
-      active|activating) ;;
+      active|activating)
+        ;;
       *)
         log "service state is not healthy: ${state:-unknown}"
         return 1
@@ -573,8 +661,10 @@ wait_for_initd_service_active() {
 }
 
 wait_for_service_active() {
+  local baseline_restarts="${1:-}"
+
   case "$SERVICE_MANAGER" in
-    systemd) wait_for_systemd_service_active "${1:-}" ;;
+    systemd) wait_for_systemd_service_active "$baseline_restarts" ;;
     initd) wait_for_initd_service_active ;;
   esac
 }
@@ -597,17 +687,23 @@ log_recent_service_logs() {
 }
 
 install_package() {
-  log "installing package: $1"
+  local package_path="$1"
+
+  log "installing package: $package_path"
   case "$PACKAGE_MANAGER" in
-    deb) dpkg -i "$1" ;;
-    apk) apk add --allow-untrusted "$1" ;;
+    deb) dpkg -i "$package_path" ;;
+    apk) apk add --allow-untrusted "$package_path" ;;
   esac
 }
 
 restart_service() {
   case "$SERVICE_MANAGER" in
-    systemd) systemctl daemon-reload && systemctl restart "$SERVICE_NAME" ;;
-    initd) "$INIT_SCRIPT" restart ;;
+    systemd)
+      systemctl daemon-reload && systemctl restart "$SERVICE_NAME"
+      ;;
+    initd)
+      "$INIT_SCRIPT" restart
+      ;;
   esac
 }
 
@@ -650,6 +746,8 @@ main() {
   local latest_package
   local baseline_restarts
 
+  parse_args "$@"
+
   require_root
   setup_logging
   acquire_lock
@@ -689,6 +787,24 @@ main() {
   detect_current_version
 
   log "current sing-box version: $CURRENT_VERSION"
+
+  if [ "$FORCE_INSTALL" = "1" ]; then
+    if [ -z "$FORCE_VERSION" ]; then
+      die "force version is empty"
+    fi
+
+    log "force install requested: $FORCE_VERSION"
+    latest_package="$(ensure_cached_package "$FORCE_VERSION")" ||
+      die "failed to download forced package: $FORCE_VERSION"
+
+    if ! install_package "$latest_package"; then
+      die "package manager failed while force installing $FORCE_VERSION"
+    fi
+
+    log "force install completed: $CURRENT_VERSION -> $FORCE_VERSION"
+    log "service was not restarted; update configuration and restart $SERVICE_NAME manually"
+    exit 0
+  fi
 
   if ! is_service_active; then
     die "service is not active before update; refusing to touch installed package: $SERVICE_NAME"
