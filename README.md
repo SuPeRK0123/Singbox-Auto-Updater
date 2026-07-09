@@ -1,4 +1,4 @@
-# Singbox-Auto-Updater
+# sing-box beta 安全更新器
 
 用途：维护已通过官方方式安装的 sing-box beta。脚本检查 GitHub Releases 最新 prerelease，安装前缓存当前版本包；如果新版本配置校验失败、服务启动失败或短时间内崩溃，自动回滚到更新前版本。
 
@@ -35,6 +35,16 @@ install -m 0755 singbox-updater /usr/local/sbin/singbox-updater
 ```sh
 /usr/local/sbin/singbox-updater
 ```
+
+手动运行时会直接在终端显示进度，同时写入 `/var/log/singbox-updater.log`。
+
+强制安装指定版本：
+
+```sh
+/usr/local/sbin/singbox-updater --force 1.14.0-alpha.41
+```
+
+强制模式只安装指定 release 包，不执行新版本配置检查、不重启 `sing-box`、不自动回滚。适用于你需要先更新二进制文件，再手动修改配置适配新版本的场景。
 
 ## 配置
 
@@ -148,6 +158,7 @@ logread | grep -i sing-box
 - Debian 使用 systemd 的重启计数判断短时间崩溃。
 - OpenWrt 使用 `/etc/init.d` 状态和 `sing-box` 进程 PID 变化判断短时间崩溃。
 - 回滚成功后，`sing-box` 服务应恢复运行；更新器默认以退出码 `20` 结束，方便看出发生过回滚。
+- `--force VERSION` 会跳过上述安全流程，只安装指定版本包，并保留当前服务运行状态。
 
 ## 注意
 
