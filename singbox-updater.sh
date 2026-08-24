@@ -10,7 +10,7 @@ CONFIG_FILE="${CONFIG_FILE:-/etc/sing-box/config.json}"
 CACHE_DIR="${CACHE_DIR:-/var/cache/singbox-updater}"
 LOG_FILE="${LOG_FILE:-/var/log/singbox-updater.log}"
 LOCK_PATH="${LOCK_PATH:-${LOCK_FILE:-/tmp/singbox-updater.lock}}"
-VERIFY_SECONDS="${VERIFY_SECONDS:-30}"
+VERIFY_SECONDS="${VERIFY_SECONDS:-5}"
 LOG_LINES="${LOG_LINES:-80}"
 PACKAGE_OS="${PACKAGE_OS:-auto}"
 PACKAGE_ARCH="${PACKAGE_ARCH:-}"
@@ -32,12 +32,21 @@ ROLLBACK_PACKAGE=""
 LOCK_ACQUIRED=0
 FORCE_VERSION=""
 FORCE_INSTALL=0
+INSTALL_ONLY=0
+RELEASE_CHANNEL="beta"
+UPDATE_REQUESTED=0
+STATUS_REQUESTED=0
+MANUAL_ROLLBACK=0
+ROLLBACK_TARGET=""
 LOG_PIPE=""
 
 usage() {
   cat <<'USAGE'
 Usage: singbox-updater
+       singbox-updater --update [--channel stable|beta]
        singbox-updater --force VERSION
+       singbox-updater --install [VERSION] [--channel stable|beta]
+       singbox-updater --rollback [VERSION]
 
 Defaults:
   config file: /etc/sing-box/config.json
@@ -45,8 +54,17 @@ Defaults:
   service:     sing-box
 
 Options:
+  --update         update to the latest release in the selected channel
+  --channel NAME   select stable or beta (default: beta)
   --force VERSION  install the specified release package only; skip post-install
                    config check, service restart, and automatic rollback
+  --install [VERSION]
+                   install sing-box when it is not already installed. Without a
+                   version, install the latest prerelease. It does not require a
+                   configuration file and does not enable or start the service.
+  --rollback [VERSION]
+                   roll back to a cached package; without a version, show a list
+                   for interactive selection
   -h, --help       show this help
 
 Optional overrides:
@@ -84,6 +102,49 @@ parse_args() {
         FORCE_INSTALL=1
         shift
         ;;
+      --update)
+        UPDATE_REQUESTED=1
+        shift
+        ;;
+      --channel)
+        if [ -z "${2:-}" ]; then
+          die "--channel requires stable or beta"
+        fi
+        RELEASE_CHANNEL="$2"
+        shift 2
+        ;;
+      --channel=*)
+        RELEASE_CHANNEL="${1#*=}"
+        shift
+        ;;
+      --install)
+        INSTALL_ONLY=1
+        if [ -n "${2:-}" ] && [ "${2#-}" = "$2" ]; then
+          FORCE_VERSION="$(normalize_version "$2")"
+          shift 2
+        else
+          shift
+        fi
+        ;;
+      --install=*)
+        INSTALL_ONLY=1
+        FORCE_VERSION="$(normalize_version "${1#*=}")"
+        shift
+        ;;
+      --rollback)
+        MANUAL_ROLLBACK=1
+        if [ -n "${2:-}" ] && [ "${2#-}" = "$2" ]; then
+          ROLLBACK_TARGET="$(normalize_version "$2")"
+          shift 2
+        else
+          shift
+        fi
+        ;;
+      --rollback=*)
+        MANUAL_ROLLBACK=1
+        ROLLBACK_TARGET="$(normalize_version "${1#*=}")"
+        shift
+        ;;
       *)
         printf '%s\n' "ERROR: unknown argument: $1" >&2
         usage >&2
@@ -91,6 +152,11 @@ parse_args() {
         ;;
     esac
   done
+
+  case "$RELEASE_CHANNEL" in
+    stable|beta) ;;
+    *) die "unsupported channel: $RELEASE_CHANNEL (use stable or beta)" ;;
+  esac
 }
 
 timestamp() {
@@ -310,6 +376,19 @@ ensure_package_installed() {
   esac
 }
 
+is_package_installed() {
+  case "$PACKAGE_MANAGER" in
+    deb)
+      [ "$(dpkg-query -W -f='${Status}' "$PACKAGE_NAME" 2>/dev/null || true)" = "install ok installed" ]
+      ;;
+    apk)
+      apk info -e "$PACKAGE_NAME" >/dev/null 2>&1 ||
+        apk list -I "$PACKAGE_NAME" 2>/dev/null |
+          awk -v pkg="$PACKAGE_NAME" 'index($1, pkg "-") == 1 { found = 1 } END { exit(found ? 0 : 1) }'
+      ;;
+  esac
+}
+
 detect_current_version() {
   local version_output
 
@@ -382,6 +461,27 @@ fetch_latest_beta_version() {
   done
 
   return 1
+}
+
+fetch_latest_stable_version() {
+  local api_url
+  local release_json
+  local parsed_version
+
+  api_url="${RELEASE_API_BASE}/repos/${RELEASE_REPO}/releases/latest"
+  if ! release_json="$(curl_api "$api_url")"; then
+    return 1
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    parsed_version="$(printf '%s\n' "$release_json" | jq -r '.tag_name // empty')"
+  else
+    parsed_version="$(printf '%s\n' "$release_json" |
+      awk '/"tag_name"[[:space:]]*:/ { tag = $0; sub(/^.*"tag_name"[[:space:]]*:[[:space:]]*"/, "", tag); sub(/".*$/, "", tag); print tag; exit }')"
+  fi
+
+  LATEST_VERSION="$(normalize_version "$parsed_version")"
+  [ -n "$LATEST_VERSION" ]
 }
 
 package_filename() {
@@ -546,6 +646,69 @@ run_config_check() {
   "$SING_BOX_BIN" check -c "$CONFIG_FILE"
 }
 
+show_menu() {
+  cat <<'MENU'
+
+sing-box updater
+1) Update to the latest stable release
+2) Update to the latest beta release
+3) Force install a specified version (no restart or rollback)
+4) First-time install: latest stable release (does not start the service)
+5) First-time install: latest beta release (does not start the service)
+6) Show status
+7) Roll back to a cached version
+0) Exit
+MENU
+}
+
+read_menu_choice() {
+  local choice
+
+  if [ ! -t 0 ]; then
+    die "no command specified and standard input is not interactive; use --install or --force VERSION"
+  fi
+
+  show_menu
+  printf '%s' 'Select an option: '
+  IFS= read -r choice || exit 0
+
+  case "$choice" in
+    1)
+      UPDATE_REQUESTED=1
+      RELEASE_CHANNEL="stable"
+      ;;
+    2)
+      UPDATE_REQUESTED=1
+      RELEASE_CHANNEL="beta"
+      ;;
+    3)
+      printf '%s' 'Version to install (for example 1.12.0-beta.1): '
+      IFS= read -r FORCE_VERSION || die "failed to read version"
+      FORCE_VERSION="$(normalize_version "$FORCE_VERSION")"
+      [ -n "$FORCE_VERSION" ] || die "version cannot be empty"
+      FORCE_INSTALL=1
+      ;;
+    4)
+      INSTALL_ONLY=1
+      RELEASE_CHANNEL="stable"
+      ;;
+    5)
+      INSTALL_ONLY=1
+      RELEASE_CHANNEL="beta"
+      ;;
+    6)
+      STATUS_REQUESTED=1
+      ;;
+    7)
+      MANUAL_ROLLBACK=1
+      ;;
+    0)
+      exit 0
+      ;;
+    *) die "invalid menu selection: $choice" ;;
+  esac
+}
+
 is_number() {
   case "$1" in
     ''|*[!0-9]*)
@@ -707,6 +870,187 @@ restart_service() {
   esac
 }
 
+install_new_instance() {
+  local install_version
+  local install_package
+
+  if [ -n "$FORCE_VERSION" ]; then
+    install_version="$FORCE_VERSION"
+  elif [ "$RELEASE_CHANNEL" = "stable" ]; then
+    if ! fetch_latest_stable_version; then
+      die "failed to find the latest stable release from ${RELEASE_REPO}"
+    fi
+    install_version="$LATEST_VERSION"
+  else
+    if ! fetch_latest_beta_version; then
+      die "failed to find a prerelease version from ${RELEASE_REPO}"
+    fi
+    install_version="$LATEST_VERSION"
+  fi
+
+  log "installing sing-box version: $install_version"
+  install_package="$(ensure_cached_package "$install_version")" ||
+    die "failed to download installation package: $install_version"
+
+  if ! install_package "$install_package"; then
+    die "package manager failed while installing $install_version"
+  fi
+
+  log "sing-box installed successfully: $install_version"
+  log "the service was not enabled or started; edit $CONFIG_FILE, then start $SERVICE_NAME manually"
+  case "$SERVICE_MANAGER" in
+    systemd) log "next step: systemctl enable --now $SERVICE_NAME" ;;
+    initd) log "next step: $INIT_SCRIPT enable && $INIT_SCRIPT start" ;;
+  esac
+}
+
+cached_package_path() {
+  local version="$1"
+  local package_path
+
+  package_path="${CACHE_DIR}/packages/$(package_filename "$version")"
+  if [ -s "$package_path" ] && verify_package "$package_path"; then
+    printf '%s\n' "$package_path"
+    return 0
+  fi
+
+  return 1
+}
+
+list_cached_versions() {
+  local package_path
+  local file_name
+  local version
+  local suffix
+  local extension
+
+  case "$PACKAGE_MANAGER" in
+    deb) extension="deb" ;;
+    apk) extension="apk" ;;
+  esac
+  suffix="_${PACKAGE_OS}_${ARCH}.${extension}"
+
+  for package_path in "${CACHE_DIR}/packages/${RELEASE_ASSET_NAME}_"*"${suffix}"; do
+    [ -f "$package_path" ] || continue
+    file_name="${package_path##*/}"
+    version="${file_name#${RELEASE_ASSET_NAME}_}"
+    version="${version%${suffix}}"
+    printf '%s\n' "$version"
+  done
+}
+
+select_cached_rollback_version() {
+  local selected
+  local index=0
+  local version
+
+  printf '%s\n' 'Cached rollback versions:'
+  for version in $(list_cached_versions); do
+    index=$((index + 1))
+    printf '%s\n' "  $index) $version"
+  done
+
+  [ "$index" -gt 0 ] || die "no cached packages are available for rollback"
+  printf '%s' 'Select a version: '
+  IFS= read -r selected || die "failed to read rollback selection"
+  is_number "$selected" && [ "$selected" -ge 1 ] && [ "$selected" -le "$index" ] ||
+    die "invalid rollback selection: $selected"
+
+  index=0
+  for version in $(list_cached_versions); do
+    index=$((index + 1))
+    if [ "$index" -eq "$selected" ]; then
+      ROLLBACK_TARGET="$version"
+      return 0
+    fi
+  done
+
+  die "failed to select cached rollback version"
+}
+
+show_status() {
+  local enabled_state
+  local cache_count=0
+  local version
+
+  log "package manager: $PACKAGE_MANAGER; service manager: $SERVICE_MANAGER"
+  if is_package_installed; then
+    detect_sing_box_binary
+    detect_current_version
+    log "installed version: $CURRENT_VERSION"
+  else
+    log "sing-box is not installed"
+  fi
+
+  if is_service_active; then
+    log "service status: active"
+  else
+    log "service status: inactive"
+  fi
+
+  if [ "$SERVICE_MANAGER" = "systemd" ]; then
+    enabled_state="$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || true)"
+    log "service startup: ${enabled_state:-unknown}"
+  fi
+
+  for version in $(list_cached_versions); do
+    cache_count=$((cache_count + 1))
+  done
+  log "cached package versions: $cache_count"
+}
+
+manual_rollback() {
+  local target_package
+  local baseline_restarts
+
+  ensure_package_installed
+  detect_sing_box_binary
+  detect_current_version
+
+  if [ -z "$ROLLBACK_TARGET" ]; then
+    if [ ! -t 0 ]; then
+      die "--rollback requires a version when standard input is not interactive"
+    fi
+    select_cached_rollback_version
+  fi
+
+  if [ "$ROLLBACK_TARGET" = "$CURRENT_VERSION" ]; then
+    die "already running sing-box $CURRENT_VERSION"
+  fi
+  if ! is_service_active; then
+    die "service is not active before rollback: $SERVICE_NAME"
+  fi
+  if ! run_config_check; then
+    die "current configuration does not pass validation; refusing rollback"
+  fi
+
+  ROLLBACK_PACKAGE="$(ensure_cached_package "$CURRENT_VERSION")" ||
+    die "failed to cache current package before rollback: $CURRENT_VERSION"
+  target_package="$(cached_package_path "$ROLLBACK_TARGET")" ||
+    die "rollback package is not cached or is invalid: $ROLLBACK_TARGET"
+  LATEST_VERSION="$ROLLBACK_TARGET"
+
+  log "rolling back manually: $CURRENT_VERSION -> $ROLLBACK_TARGET"
+  if ! install_package "$target_package"; then
+    rollback "package manager failed while rolling back to $ROLLBACK_TARGET"
+  fi
+
+  detect_sing_box_binary
+  if ! run_config_check; then
+    rollback "configuration check failed after rolling back to $ROLLBACK_TARGET"
+  fi
+
+  baseline_restarts="$(service_restart_count)"
+  if ! restart_service; then
+    rollback "service restart failed after rolling back to $ROLLBACK_TARGET"
+  fi
+  if ! wait_for_service_active "$baseline_restarts"; then
+    rollback "service did not stay active after rolling back to $ROLLBACK_TARGET"
+  fi
+
+  log "rolled back sing-box successfully: $CURRENT_VERSION -> $ROLLBACK_TARGET"
+}
+
 rollback() {
   local reason="$1"
   local rollback_message
@@ -748,6 +1092,10 @@ main() {
 
   parse_args "$@"
 
+  if [ "$#" -eq 0 ]; then
+    read_menu_choice
+  fi
+
   require_root
   setup_logging
   acquire_lock
@@ -773,15 +1121,38 @@ main() {
 
   case "$SERVICE_MANAGER" in
     systemd)
-      require_command systemctl
-      require_command journalctl
+      if [ "$INSTALL_ONLY" != "1" ] && [ "$STATUS_REQUESTED" != "1" ]; then
+        require_command systemctl
+        require_command journalctl
+      fi
       ;;
     initd)
-      [ -x "$INIT_SCRIPT" ] || die "init script is not executable: $INIT_SCRIPT"
+      if [ "$INSTALL_ONLY" != "1" ] && [ "$STATUS_REQUESTED" != "1" ]; then
+        [ -x "$INIT_SCRIPT" ] || die "init script is not executable: $INIT_SCRIPT"
+      fi
       ;;
   esac
 
   detect_arch
+
+  if [ "$STATUS_REQUESTED" = "1" ]; then
+    show_status
+    exit 0
+  fi
+
+  if [ "$INSTALL_ONLY" = "1" ]; then
+    if is_package_installed; then
+      die "sing-box is already installed; use option 1 to update or option 2 to force install"
+    fi
+    install_new_instance
+    exit 0
+  fi
+
+  if [ "$MANUAL_ROLLBACK" = "1" ]; then
+    manual_rollback
+    exit 0
+  fi
+
   detect_sing_box_binary
   ensure_package_installed
   detect_current_version
@@ -815,11 +1186,15 @@ main() {
     die "current configuration does not pass validation with current binary; aborting before update"
   fi
 
-  if ! fetch_latest_beta_version; then
+  if [ "$RELEASE_CHANNEL" = "stable" ]; then
+    if ! fetch_latest_stable_version; then
+      die "failed to find the latest stable release from ${RELEASE_REPO}"
+    fi
+  elif ! fetch_latest_beta_version; then
     die "failed to find a prerelease version from ${RELEASE_REPO}"
   fi
 
-  log "latest beta version: $LATEST_VERSION"
+  log "latest $RELEASE_CHANNEL version: $LATEST_VERSION"
 
   if [ "$CURRENT_VERSION" = "$LATEST_VERSION" ]; then
     log "already on latest beta; no update needed"
