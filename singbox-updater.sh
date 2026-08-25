@@ -35,10 +35,26 @@ FORCE_INSTALL=0
 INSTALL_ONLY=0
 RELEASE_CHANNEL="beta"
 UPDATE_REQUESTED=0
-STATUS_REQUESTED=0
 MANUAL_ROLLBACK=0
 ROLLBACK_TARGET=""
 LOG_PIPE=""
+COLOR_RESET=""
+COLOR_RED=""
+COLOR_GREEN=""
+COLOR_YELLOW=""
+COLOR_BLUE=""
+COLOR_DIM=""
+
+init_colors() {
+  if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    COLOR_RESET='\033[0m'
+    COLOR_RED='\033[31m'
+    COLOR_GREEN='\033[32m'
+    COLOR_YELLOW='\033[33m'
+    COLOR_BLUE='\033[34m'
+    COLOR_DIM='\033[2m'
+  fi
+}
 
 usage() {
   cat <<'USAGE'
@@ -646,67 +662,127 @@ run_config_check() {
   "$SING_BOX_BIN" check -c "$CONFIG_FILE"
 }
 
-show_menu() {
-  cat <<'MENU'
+show_menu_status() {
+  local menu_version="未安装"
+  local service_state="未知"
+  local startup_state="未知"
+  local version_output
 
-sing-box updater
-1) Update to the latest stable release
-2) Update to the latest beta release
-3) Force install a specified version (no restart or rollback)
-4) First-time install: latest stable release (does not start the service)
-5) First-time install: latest beta release (does not start the service)
-6) Show status
-7) Roll back to a cached version
-0) Exit
-MENU
+  if command -v sing-box >/dev/null 2>&1; then
+    version_output="$(sing-box version 2>/dev/null || true)"
+    menu_version="$(printf '%s\n' "$version_output" | awk '/^sing-box version / { print $3; exit }')"
+    [ -n "$menu_version" ] || menu_version="未知"
+  fi
+
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+      service_state="运行中"
+    else
+      service_state="未运行"
+    fi
+    startup_state="$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || true)"
+    [ -n "$startup_state" ] || startup_state="未知"
+  elif [ -x "$INIT_SCRIPT" ]; then
+    if "$INIT_SCRIPT" status >/dev/null 2>&1 || "$INIT_SCRIPT" running >/dev/null 2>&1; then
+      service_state="运行中"
+    else
+      service_state="未运行"
+    fi
+    if "$INIT_SCRIPT" enabled >/dev/null 2>&1; then
+      startup_state="已启用"
+    else
+      startup_state="未启用"
+    fi
+  fi
+
+  printf '\n%b当前版本：%b %b%s%b\n' "$COLOR_DIM" "$COLOR_RESET" "$COLOR_BLUE" "$menu_version" "$COLOR_RESET"
+  if [ "$service_state" = "运行中" ]; then
+    printf '%b运行状态：%b %b%s%b\n' "$COLOR_DIM" "$COLOR_RESET" "$COLOR_GREEN" "$service_state" "$COLOR_RESET"
+  else
+    printf '%b运行状态：%b %b%s%b\n' "$COLOR_DIM" "$COLOR_RESET" "$COLOR_RED" "$service_state" "$COLOR_RESET"
+  fi
+  case "$startup_state" in
+    enabled|已启用)
+      printf '%b开机启动：%b %b%s%b\n' "$COLOR_DIM" "$COLOR_RESET" "$COLOR_GREEN" "$startup_state" "$COLOR_RESET"
+      ;;
+    *)
+      printf '%b开机启动：%b %b%s%b\n' "$COLOR_DIM" "$COLOR_RESET" "$COLOR_YELLOW" "$startup_state" "$COLOR_RESET"
+      ;;
+  esac
+}
+
+select_release_channel() {
+  local action="$1"
+  local choice
+
+  printf '\n%b%s%b\n' "$COLOR_BLUE" "$action - 请选择版本渠道" "$COLOR_RESET"
+  printf '%b1.%b 正式版\n' "$COLOR_GREEN" "$COLOR_RESET"
+  printf '%b2.%b 测试版\n' "$COLOR_YELLOW" "$COLOR_RESET"
+  printf '%b3.%b 返回\n' "$COLOR_DIM" "$COLOR_RESET"
+  printf '%s' '请输入选项：'
+  IFS= read -r choice || return 1
+
+  case "$choice" in
+    1) RELEASE_CHANNEL="stable" ;;
+    2) RELEASE_CHANNEL="beta" ;;
+    0|3) return 1 ;;
+    *) die "无效的版本渠道选项：$choice" ;;
+  esac
+}
+
+show_menu() {
+  show_menu_status
+  printf '\n%b%s%b\n' "$COLOR_BLUE" 'sing-box 更新器' "$COLOR_RESET"
+  printf '%b1.%b 更新 sing-box\n' "$COLOR_GREEN" "$COLOR_RESET"
+  printf '%b2.%b 首次安装 sing-box\n' "$COLOR_GREEN" "$COLOR_RESET"
+  printf '%b3.%b 强制安装指定版本（不重启、不自动回滚）\n' "$COLOR_YELLOW" "$COLOR_RESET"
+  printf '%b4.%b 回滚到本地缓存版本\n' "$COLOR_YELLOW" "$COLOR_RESET"
+  printf '%b5.%b 退出\n\n' "$COLOR_DIM" "$COLOR_RESET"
 }
 
 read_menu_choice() {
   local choice
 
   if [ ! -t 0 ]; then
-    die "no command specified and standard input is not interactive; use --install or --force VERSION"
+    die "未指定命令且标准输入不是交互终端；请使用 --update、--install 或 --force VERSION"
   fi
 
-  show_menu
-  printf '%s' 'Select an option: '
-  IFS= read -r choice || exit 0
+  while :; do
+    show_menu
+    printf '%s' '请输入选项：'
+    IFS= read -r choice || exit 0
 
-  case "$choice" in
-    1)
-      UPDATE_REQUESTED=1
-      RELEASE_CHANNEL="stable"
-      ;;
-    2)
-      UPDATE_REQUESTED=1
-      RELEASE_CHANNEL="beta"
-      ;;
-    3)
-      printf '%s' 'Version to install (for example 1.12.0-beta.1): '
-      IFS= read -r FORCE_VERSION || die "failed to read version"
-      FORCE_VERSION="$(normalize_version "$FORCE_VERSION")"
-      [ -n "$FORCE_VERSION" ] || die "version cannot be empty"
-      FORCE_INSTALL=1
-      ;;
-    4)
-      INSTALL_ONLY=1
-      RELEASE_CHANNEL="stable"
-      ;;
-    5)
-      INSTALL_ONLY=1
-      RELEASE_CHANNEL="beta"
-      ;;
-    6)
-      STATUS_REQUESTED=1
-      ;;
-    7)
-      MANUAL_ROLLBACK=1
-      ;;
-    0)
-      exit 0
-      ;;
-    *) die "invalid menu selection: $choice" ;;
-  esac
+    case "$choice" in
+      1)
+        if select_release_channel "更新 sing-box"; then
+          UPDATE_REQUESTED=1
+          return 0
+        fi
+        ;;
+      2)
+        if select_release_channel "首次安装 sing-box"; then
+          INSTALL_ONLY=1
+          return 0
+        fi
+        ;;
+      3)
+        printf '%s' '请输入版本号（例如 1.12.0-beta.1）：'
+        IFS= read -r FORCE_VERSION || continue
+        FORCE_VERSION="$(normalize_version "$FORCE_VERSION")"
+        [ -n "$FORCE_VERSION" ] || die "version cannot be empty"
+        FORCE_INSTALL=1
+        return 0
+        ;;
+      4)
+        MANUAL_ROLLBACK=1
+        return 0
+        ;;
+      0|5)
+        exit 0
+        ;;
+      *) die "无效的主菜单选项：$choice" ;;
+    esac
+  done
 }
 
 is_number() {
@@ -944,17 +1020,17 @@ select_cached_rollback_version() {
   local index=0
   local version
 
-  printf '%s\n' 'Cached rollback versions:'
+  printf '\n%b%s%b\n' "$COLOR_YELLOW" '可回滚的缓存版本：' "$COLOR_RESET"
   for version in $(list_cached_versions); do
     index=$((index + 1))
-    printf '%s\n' "  $index) $version"
+    printf '%b%s%b\n' "$COLOR_BLUE" "  $index. $version" "$COLOR_RESET"
   done
 
-  [ "$index" -gt 0 ] || die "no cached packages are available for rollback"
-  printf '%s' 'Select a version: '
-  IFS= read -r selected || die "failed to read rollback selection"
+  [ "$index" -gt 0 ] || die "没有可用于回滚的缓存包"
+  printf '%s' '请选择版本（Ctrl+C 可退出）：'
+  IFS= read -r selected || return 2
   is_number "$selected" && [ "$selected" -ge 1 ] && [ "$selected" -le "$index" ] ||
-    die "invalid rollback selection: $selected"
+    die "无效的回滚版本选项：$selected"
 
   index=0
   for version in $(list_cached_versions); do
@@ -965,38 +1041,26 @@ select_cached_rollback_version() {
     fi
   done
 
-  die "failed to select cached rollback version"
+  die "无法选择缓存回滚版本"
 }
 
-show_status() {
-  local enabled_state
-  local cache_count=0
-  local version
+cleanup_cached_packages() {
+  local keep_version="$1"
+  local keep_path
+  local package_path
+  local removed=0
 
-  log "package manager: $PACKAGE_MANAGER; service manager: $SERVICE_MANAGER"
-  if is_package_installed; then
-    detect_sing_box_binary
-    detect_current_version
-    log "installed version: $CURRENT_VERSION"
-  else
-    log "sing-box is not installed"
-  fi
-
-  if is_service_active; then
-    log "service status: active"
-  else
-    log "service status: inactive"
-  fi
-
-  if [ "$SERVICE_MANAGER" = "systemd" ]; then
-    enabled_state="$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || true)"
-    log "service startup: ${enabled_state:-unknown}"
-  fi
-
-  for version in $(list_cached_versions); do
-    cache_count=$((cache_count + 1))
+  keep_path="${CACHE_DIR}/packages/$(package_filename "$keep_version")"
+  for package_path in "${CACHE_DIR}/packages/${RELEASE_ASSET_NAME}_"*; do
+    [ -f "$package_path" ] || continue
+    [ "$package_path" = "$keep_path" ] && continue
+    rm -f "$package_path"
+    removed=$((removed + 1))
   done
-  log "cached package versions: $cache_count"
+
+  if [ "$removed" -gt 0 ]; then
+    log "cache cleanup completed: kept $keep_version, removed $removed old package(s)"
+  fi
 }
 
 manual_rollback() {
@@ -1011,7 +1075,7 @@ manual_rollback() {
     if [ ! -t 0 ]; then
       die "--rollback requires a version when standard input is not interactive"
     fi
-    select_cached_rollback_version
+    select_cached_rollback_version || return $?
   fi
 
   if [ "$ROLLBACK_TARGET" = "$CURRENT_VERSION" ]; then
@@ -1049,6 +1113,7 @@ manual_rollback() {
   fi
 
   log "rolled back sing-box successfully: $CURRENT_VERSION -> $ROLLBACK_TARGET"
+  cleanup_cached_packages "$CURRENT_VERSION"
 }
 
 rollback() {
@@ -1089,7 +1154,9 @@ rollback() {
 main() {
   local latest_package
   local baseline_restarts
+  local rollback_status
 
+  init_colors
   parse_args "$@"
 
   if [ "$#" -eq 0 ]; then
@@ -1121,24 +1188,19 @@ main() {
 
   case "$SERVICE_MANAGER" in
     systemd)
-      if [ "$INSTALL_ONLY" != "1" ] && [ "$STATUS_REQUESTED" != "1" ]; then
+      if [ "$INSTALL_ONLY" != "1" ]; then
         require_command systemctl
         require_command journalctl
       fi
       ;;
     initd)
-      if [ "$INSTALL_ONLY" != "1" ] && [ "$STATUS_REQUESTED" != "1" ]; then
+      if [ "$INSTALL_ONLY" != "1" ]; then
         [ -x "$INIT_SCRIPT" ] || die "init script is not executable: $INIT_SCRIPT"
       fi
       ;;
   esac
 
   detect_arch
-
-  if [ "$STATUS_REQUESTED" = "1" ]; then
-    show_status
-    exit 0
-  fi
 
   if [ "$INSTALL_ONLY" = "1" ]; then
     if is_package_installed; then
@@ -1149,8 +1211,18 @@ main() {
   fi
 
   if [ "$MANUAL_ROLLBACK" = "1" ]; then
-    manual_rollback
-    exit 0
+    if manual_rollback; then
+      exit 0
+    fi
+    rollback_status=$?
+    if [ "$rollback_status" -eq 2 ] && [ -t 0 ]; then
+      exec "$0"
+    fi
+    exit "$rollback_status"
+  fi
+
+  if [ "$UPDATE_REQUESTED" != "1" ] && [ "$FORCE_INSTALL" != "1" ]; then
+    die "未选择操作；请使用 --update、--install、--force 或 --rollback"
   fi
 
   detect_sing_box_binary
@@ -1197,7 +1269,7 @@ main() {
   log "latest $RELEASE_CHANNEL version: $LATEST_VERSION"
 
   if [ "$CURRENT_VERSION" = "$LATEST_VERSION" ]; then
-    log "already on latest beta; no update needed"
+    log "already on the latest $RELEASE_CHANNEL version; no update needed"
     exit 0
   fi
 
@@ -1208,7 +1280,7 @@ main() {
     die "failed to cache rollback package for current version: $CURRENT_VERSION"
 
   latest_package="$(ensure_cached_package "$LATEST_VERSION")" ||
-    die "failed to download latest beta package: $LATEST_VERSION"
+    die "failed to download latest $RELEASE_CHANNEL package: $LATEST_VERSION"
 
   if ! install_package "$latest_package"; then
     rollback "package manager failed while installing $LATEST_VERSION"
@@ -1231,6 +1303,7 @@ main() {
   fi
 
   log "updated sing-box successfully: $CURRENT_VERSION -> $LATEST_VERSION"
+  cleanup_cached_packages "$CURRENT_VERSION"
 }
 
 main "$@"
