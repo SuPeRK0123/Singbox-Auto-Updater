@@ -1045,21 +1045,26 @@ select_cached_rollback_version() {
 }
 
 cleanup_cached_packages() {
-  local keep_version="$1"
-  local keep_path
+  local keep_version
+  local keep_paths=" "
   local package_path
   local removed=0
 
-  keep_path="${CACHE_DIR}/packages/$(package_filename "$keep_version")"
+  for keep_version in "$@"; do
+    keep_paths="${keep_paths}${CACHE_DIR}/packages/$(package_filename "$keep_version") "
+  done
+
   for package_path in "${CACHE_DIR}/packages/${RELEASE_ASSET_NAME}_"*; do
     [ -f "$package_path" ] || continue
-    [ "$package_path" = "$keep_path" ] && continue
+    case "$keep_paths" in
+      *" $package_path "*) continue ;;
+    esac
     rm -f "$package_path"
     removed=$((removed + 1))
   done
 
   if [ "$removed" -gt 0 ]; then
-    log "cache cleanup completed: kept $keep_version, removed $removed old package(s)"
+    log "cache cleanup completed: kept $# package(s), removed $removed old package(s)"
   fi
 }
 
@@ -1113,7 +1118,7 @@ manual_rollback() {
   fi
 
   log "rolled back sing-box successfully: $CURRENT_VERSION -> $ROLLBACK_TARGET"
-  cleanup_cached_packages "$CURRENT_VERSION"
+  cleanup_cached_packages "$CURRENT_VERSION" "$ROLLBACK_TARGET"
 }
 
 rollback() {
@@ -1303,7 +1308,7 @@ main() {
   fi
 
   log "updated sing-box successfully: $CURRENT_VERSION -> $LATEST_VERSION"
-  cleanup_cached_packages "$CURRENT_VERSION"
+  cleanup_cached_packages "$CURRENT_VERSION" "$LATEST_VERSION"
 }
 
 main "$@"
